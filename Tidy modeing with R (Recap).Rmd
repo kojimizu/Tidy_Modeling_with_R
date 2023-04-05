@@ -1,0 +1,613 @@
+---
+title: "Modeling with tidymodels in R"
+author: "Koji Mizumura"
+date: "25 March,2021 - "
+always_allow_html: yes
+output:
+  rmdformats::readthedown:
+    highlight: kate
+
+# output:
+#   html_output: 
+#     toc: yes
+#     toc_depth: 4
+#     toc_float: yes
+#     number_sections: yes
+#     section_divs: yes
+#     theme: "readable"
+#       pdf_document:
+#     toc: yes
+#   rmdformats::readthedown:
+#     highlight: kate
+#     # code_folding: hide
+#     # self_contained: true
+#     # thumbnails: false
+#     # lightbox: false
+#     # md_extensions: -ascii_identifiers
+#   word_document:
+#     toc: yes
+---
+
+```{r knitr_init, echo=FALSE, cache=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+                 cache=FALSE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+
+# CHAPTER 5 SPENDING OUR DATA
+
+There are several steps to creating a useful model, including parameter estimation, model selection and tuning, and performance assessment. At the start of a new project, there is usually an initial finite pool of data available for all these tasks, which we can think of as an available data budget. How should the data be applied to different steps or tasks? The idea of data spending is an important first consideration when modeling, especially as it relates to empirical validation.
+
+When there are copious amounts of data available, a smart strategy is to allocate specific subsets of data for different tasks, as opposed to allocating the largest possible amount (or even all) to the model parameter estimation only. For example, one possible strategy (when both data and predictors are abundant) is to spend a specific subset of data to determine which predictors are informative, before considering parameter estimation at all. If the initial pool of data available is not huge, there will be some overlap in how and when our data is “spent” or allocated, and a solid methodology for data spending is important.
+
+This chapter demonstrates the basics of splitting (i.e., creating a data budget) for our initial pool of samples for different purposes. 
+
+## COMMON METHODS FOR SPLITTING DATA
+
+The primary approach for empirical model validation is to split the existing pool of data into two distinct sets, the training set and the test set. One portion of the data is used to develop and optimize the model. This _training set_ is usually the majority of the data. These data are a _sandbox_ for model building where different models can be fit, feature engineering strategies are investigated, and so on. As modeling practitioners, we spend the vast majority of the modeling process using the training set as the substrate to develop the model.
+
+The other portion of the data is placed into the _test set_. This is held in reserve until one or two models are chosen as the methods most likely to succeed. The test set is then used as the final arbiter to determine the efficacy of the model. It is critical to look at the test set only once; otherwise, it becomes part of the modeling process.
+
+Suppose we allocate 80% of the data to the training set and the remaining 20% for testing. The most common method is to use simple random sampling. The  __package__ has tools for making data splits such as this; the function `initial_split()` was created for this purpose. It takes the data frame as an argument as well as the proportion to be placed into training. Using the data frame produced by the code snippet from the summary in Section 4.2 that prepared the Ames data set:
+
+
+```{r}
+pacman::p_load(tidymodels)
+tidymodels_prefer()
+
+# set the random number stream using `set seed()` so that the results can be reproduced later. 
+set.seed(501)
+
+# save the split information for an 80/20 split of the data
+ames_split <- initial_split(ames, prop = 0.8)
+ames_split
+```
+
+The printed information denotes the amount of data in the training set (n=2,344) the amount in the test set (n = 586), and the size of the original pool of samples (n=2,930). 
+
+The `ames_split` is an `rsplit` object and contains only the partitioning information; to get the resulting data sets, we apply two more functions:
+
+```{r}
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+
+dim(ames_train)
+```
+
+These objects are data frames with the same columns as the original data but only the approproate for each set. 
+
+Simple random sampling is appropriate in many cases but there are exceptions. When there is a dramatic `class imbalance` in classification probles, one class occurs allocate these infrequest samples disapproportionately into the training or test set. To avid this, `stratified sampling` can be used. 
+
+The training/test split is conducted separately within each class and then these subsamples are combined into the overall training and test set. For regression problems, the outcome data can be artificially binned into quartiles and then stratified sampling can be This is an effective method for keeping the distributions of the outcome similar between the training and test set. The distribution of the sale price outcome for the Ames housing data is shown in Figure 5.1.
+
+```{r warning=FALSE}
+pacman::p_load(hrbrthemes)
+
+ames_train %>% 
+  ggplot()+
+  geom_density(aes(x=log(Sale_Price)))+
+  hrbrthemes::theme_tinyhand()
+```
+
+As discussed in Chapter 4, the sale price distribution is right-skewed, with proportionally inexpensive houses on either side of the center of the distribution. The worry here with simple splitting is that the more expensive houses would not be well represented in the training set; this would increase the risk that our model would be ineffective at predicting the price for such properties. The dotted vertical lines in Figure 5.1 indicate the four quartiles for these data. A stratified random sample would conduct the 80/20 split within each of these data subsets and then pool the results. In __rsample__, this is achieved using the strata argument:
+
+```{r}
+set.seed(502)
+
+ames_split <- initial_split(ames,prop = 0.80, strata = Sale_Price)
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+
+dim(ames_train)
+```
+
+Are there situations when random sampling is not the best choice? One case is when the data have a significant time component, such as time series data. Here, it is more common to use the most recent data as the test set. The rsample package contains a function called `initial_time_split()` that is very similar to `initial_split()`. Instead of using random sampling, the prop argument denotes what proportion of the first part of the data should be used as the training set; the function assumes that the data have been pre-sorted in an appropriate order.
+
+## What about a validation set
+
+When describing the goals of data splitting, we singled out the test set as the data that should be used to properly evaluate of model performance on the final model(s). This begs the question: “How can we tell what is best if we don’t measure performance until the test set?”
+
+It is common to hear about _validation sets_ as an answer to this question, especially in the neural network and deep learning literature. During the early days of neural networks, researchers realized that measuring performance by re-predicting the training set samples led to results that were overly optimistic (significantly, unrealistically so). This led to models that overfit, meaning that they performed very well on the training set but poorly on the test set.12 To combat this issue, a small validation set of data were held back and used to measure performance as the network was trained. Once the validation set error rate began to rise, the training would be halted. In other words, the validation set was a means to get a rough sense of how well the model performed prior to the test set.
+
+## Multilevel data 
+
+With the Ames housing data, a property is consdiered to be the `independent experiment unit`. It is safe to assume that, statistically, the data from a property are independent of other properties. For other applications, that is not always the case:
+
+- For longitudinal data, for example, the same independent experimental unit can be measured over multiple time points. An example would be a human subject in a medical trial.
+- A batch of manufactured product might also be considered the independent experimental unit. In repeated measures designs, replicate data points from a batch are collected at multiple times.
+- Johnson et al. (2018) report an experiment where different trees were sampled across the top and bottom portions of a stem. Here, the tree is the experimental unit and the data hierarchy is sample within stem position within tree.
+
+In these situations, the data set will have multiple rows per experimental unit. Simple resampling across rows would lead to some data within an experimental unit being in the training set and others in the test set. Data splitting should occur at the independent experimental unit level of the data. For example, to produce an 80/20 split of the Ames housing data set, 80% of the properties should be allocated for the training set.
+
+## Other considerations for a data budget
+When deciding how to spend the data available to you, keep a few more things in mind. First, it is critical to quarantine the test set from any model building activities. As you read this book, notice which data are exposed to the model at any given time.
+
+For example, in a machine learning competition, the test set data might be provided without the true outcome values so that the model can be scored and ranked. One potential method for improving the score might be to fit the model using the training set points that are most similar to the test set values. While the test set isn’t directly used to fit the model, it still has a heavy influence. In general, this technique is highly problematic since it reduces the generalization error of the model to optimize performance on a specific data set. There are more subtle ways that the test set data can be used during training. Keeping the training data in a separate data frame from the test set is one small check to make sure that information leakage does not occur by accident.
+
+Second, techniques to subsample the training set can mitigate specific issues (e.g., class imbalances). This is a valid and common technique that deliberately results in the training set data diverging from the population from which the data were drawn. It is critical that the test set continues to mirror what the model would encounter in the wild. In other words, the test set should always resemble new data that will be given to the model.
+
+Next, at the beginning of this chapter, we warned about using the same data for different tasks. Chapter 10 will discuss solid, data-driven methodologies for data usage that will reduce the risks related to bias, overfitting, and other issues. Many of these methods apply the data-splitting tools introduced in this chapter.
+
+## Chapter summary
+
+Data splitting is the fundamental strategy for empirical validation of models. Even in the era of unrestrained data ollection, typical modeling project has a limited amount of appropriate data and wise spending of a project's data is necessary. In this chapter, we discussed several strategies for partitioning the data into distinct groups for modeling and evaluation. 
+
+# CHAPTER 6 FITTING MODELS WITH PARSNIP 
+## CREATE A MODEL
+
+For tidymodels, the approach to specifying a model is intended to be more unified:
+
+1. Specify the type of model based on its mathematical structure (e.g., linear regression, random forest, KNN, etc).
+
+2. Specify the engine for fitting the model. Most often this reflects the software package that should be used, like Stan or glmnet. These are models in their own right, and parsnip provides consistent interfaces by using these as engines for modeling.
+
+3. When required, declare the mode of the model. The mode reflects the type of prediction outcome. For numeric outcomes, the mode is regression; for qualitative outcomes, it is classification.13 If a model algorithm can only address one type of prediction outcome, such as linear regression, the mode is already set.
+
+These specifications are built without referencing the data. For example, for the three cases we outlined:
+
+```{r}
+pacman::p_load(tidymodels)
+tidymodels::tidymodels_prefer()
+
+linear_reg() %>% set_engine("lm")
+linear_reg() %>% set_engine("glmnet")
+linear_reg() %>% set_engine("stan")
+
+```
+
+Once the details of the model have been specified, the model estimation can be done with either the `fit()` function (to use a formula) or the `fit_xy()` function (when your data are already pre-processed). The parsnip package allows the user to be indifferent to the interface of the underlying model; you can always use a formula even if the modeling package’s function only has the x/y interface.
+
+The `translate()` function can provide details on how parsnip converts the user’s code to the package’s syntax:
+
+```{r}
+linear_reg() %>% 
+  set_engine("lm") %>% 
+  translate()
+
+linear_reg(penalty = 1) %>% 
+  set_engine("glmnet") %>% 
+  translate()
+
+linear_reg() %>% 
+  set_engine("stan") %>% 
+  translate()
+```
+
+Note that `missing_arg()` is just a placeholder for the data that has yet to be provided.
+
+Let's walk through how to predict the sale price of houses in the Ames data as a function of only longitude and latitude. 
+
+```{r}
+
+lm_model <- 
+  linear_reg() %>% 
+  set_engine("lm")
+
+lm_form_fit <- 
+  lm_model %>% 
+  fit(Sale_Price ~ Longitude + Latitude, data = ames_train)
+
+
+lm_xy_fit <- 
+  lm_model %>% 
+  fit_xy(
+    x = ames_train %>% select(Longitude, Latitude),
+    y = ames_train %>% pull(Sale_Price)
+  )
+
+lm_form_fit
+lm_xy_fit
+```
+
+Not only does parsnip enable a consistent model interface for different packages, it also provides consistency in the model arguments. It is common for different functions that fit the same model to have different argument names. Random forest model functions are a good example. Three commonly used arguments are the number of trees in the ensemble, the number of predictors to randomly sample with each split within a tree, and the number of data points required to make a split. For three different R packages implementing this algorithm, those arguments are shown in Table 6.1.
+
+random forest argument names by parsnip
+
+- sampled predictors: `mtry`
+- trees: `trees`
+- data points to split: `min_n`
+
+Admittedly, this is one more set of arguments to memorize. However, when other types of models have the same argument types, these names still apply. For example, boosted tree ensembles also create a large number of tree-based models, so `trees` is also used there, as is `min_n`, and so on.
+
+Modeling functions in parsnip separate model arguments into two categories:
+
+- _Main arguments_ are more commonly used and tend to be available across engines.
+- _Engine arguments_ are either specific to a particular engine or used more rarely.
+
+For example, in the translation of the previous random forest code, the arguments `num.threads`, `verbose`, and `seed` were added by default. These arguments are specific to the ranger implementation of random forest models and wouldn’t make sense as main arguments. Engine-specific arguments can be specified in set_engine(). For example, to have the ranger::ranger() function print out more information about the fit:
+
+```{r}
+rand_forest(trees = 1000, min_n = 5) %>% 
+  set_engine("ranger", verbose = TRUE) %>% 
+  set_mode("regression")
+```
+
+
+## USE THE MODEL RESULTS
+
+Once the model is created and fit, we can use the results in a variety of ways; we might want to plot, print, or otherwise examine the model output. Several quantities are stored in a parsnip model object, including the fitted model. This can be found in an element called `fit`, which can be returned using the extract_`fit_engine()` function:
+
+```{r}
+
+lm_form_fit %>% 
+  extract_fit_engine()
+
+```
+
+Normal methods can be applied to this object, such as printing and plotting: 
+
+```{r}
+lm_form_fit %>% 
+  extract_fit_engine() %>% 
+  vcov()
+```
+
+One issue with some existing methods in base R is that the results are stored in a manner that may not be the most useful. For example, the `summary()` method for lm objects can be used to print the results of the model fit, including a table with parameter values, their uncertainty estimates, and p-values. These particular results can also be saved:
+
+```{r}
+model_res <- 
+  lm_form_fit %>% 
+  extract_fit_engine() %>% 
+  summary()
+
+# The model coefficient table is accessible via the `coef` method.
+param_est <- coef(model_res)
+class(param_est)
+```
+
+There are a few things to notice about this result. First, the object is a numeric matrix. This data structure was mostly likely chosen since all of the calculated results are numeric and a matrix object is stored more efficiently than a data frame. This choice was probably made in the late 1970s when computational efficiency was extremely critical. Second, the non-numeric data (the labels for the coefficients) are contained in the row names. Keeping the parameter labels as row names is very consistent with the conventions in the original S language.
+
+A reasonable next step might be to create a visualization of the parameter values. To do this, it would be sensible to convert the parameter matrix to a data frame. We could add the row names as a column so that they can be used in a plot. However, notice that several of the existing matrix column names would not be valid R column names for ordinary data frames (e.g., "Pr(>|t|)"). Another complication is the consistency of the column names. For lm objects, the column for the test statistic is "Pr(>|t|)", but for other models, a different test might be used and, as a result, the column name would be different (e.g., "Pr(>|z|)") and the type of test would be encoded in the column name.
+
+While these additional data formatting steps are not impossible to overcome, they are a hindrance, especially since they might be different for different types of models. The matrix is not a highly reusable data structure mostly because it constrains the data to be of a single type (e.g., numeric). Additionally, keeping some data in the dimension names is also problematic since those data must be extracted to be of general use.
+
+As a solution, the broom package can convert many types of model objects to a tidy structure. For example, using the tidy() method on the linear model produces:
+
+```{r}
+tidy(lm_form_fit)
+```
+
+The column names are standardized across models and do not contain any additional data (such as type of statistical test). The data previously contained in the row names are now in a column called `term`. One important principle in the tidymodels ecosystem is that a function should return values that are predictable, consistent and unsurprising. 
+
+## MAKE PREDICTONS
+
+Another are where parsnip diverges from conventional R modeling functions i the format of values returned from `predict()`. For predictions, parsnip always comforms the following rules:
+
+1. The results are always a tibble.
+2. The column names of the tibble are always predictable.
+3. There are always as many rows in the tibble as there are in the input data set.
+
+For example, when numeric data are predicted:
+
+```{r}
+ames_test_small <- ames_test %>% 
+  slice(1:5)
+
+predict(lm_form_fit, new_data = ames_test_small)
+```
+
+The row order of the predictions are always the same as the original data.
+
+These three rules make it easier to merge predictions with the original data:
+
+```{r}
+ames_test_small %>% 
+  select(Sale_Price) %>% 
+  bind_cols(predict(lm_form_fit, ames_test_small)) %>% 
+  # Add 95% prediction intervals to the results:
+  bind_cols(predict(lm_form_fit, ames_test_small, type = "pred_int")) 
+```
+
+The motivation for the first rule comes from some R packages producing dissimilar data types from prediction functions. For example, the ranger package is an excellent tool for computing random forest models. However, instead of returning a data frame or vector as output, it returns a specialized object that has multiple values embedded within it (including the predicted values). This is just one more step for the data analyst to work around in their scripts. As another example, the native glmnet model can return at least four different output types for predictions, depending on the model specifics and characteristics of the data. These are shown in Table 6.3.
+
+Additionally, the column names of the results contain coded values that map to a vector called lambda within the glmnet model object. This excellent statistical method can be discouraging to use in practice because of all of the special cases an analyst might encounter that require additional code to be useful.
+
+For the second tidymodels prediction rule, the predictable column names for different types of predictions are shown in Table 6.4.
+
+The third rule regarding the number of rows in the output is critical. For example, if any rows of the new data contain missing values, the output will be padded with missing results for those rows. A main advantage of standardizing the model interface and prediction types in parsnip is that, when different models are used, the syntax is identical. Suppose that we used a decision tree to model the Ames data. Outside of the model specification, there are no significant differences in the code pipeline:
+
+```{r}
+
+tree_model <- 
+  decision_tree(min_n = 2) %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression")
+
+tree_fit <- 
+  tree_model %>% 
+  fit(Sale_Price ~ Longitude + Latitude, data = ames_train)
+
+ames_test_small %>% 
+  select(Sale_Price) %>% 
+  bind_cols(predict(tree_fit, ames_test_small))
+```
+
+This demonstrates the benefit of homogenizing the data analysis process and syntax across different models. It enables users to spend their time on the results and interpretation rather than having to focus on the syntactical differences between R packages.
+
+##  PARSNIP-EXTENSION PACKAGES
+The __parsnip__ package itself contains interfaces to a number of models. However, for ease of package installation and maintenance, there are other __tidymodels__ packages that have parsnip model definitions for other sets of models. The discrim package has model definitions for the set of classification techniques called discriminant analysis methods (such as linear or quadratic discriminant analysis). In this way, the package dependencies required for installing parsnip are reduced. A list of all of the models that can be used with parsnip (across different packages that are on CRAN) can be found at https://www.tidymodels.org/find/.
+
+## Creating model specifications
+It may become tedious to write many model specifications or to remember how to write the code to generae them. THe parsnip package includes and R Studio addin that can help. Either choosing this addin from the _Addins_ toolbar menu or running the code: 
+
+```{r eval=FALSE}
+parsnip_addin()
+```
+
+will open a window in th Viewer panel of the RStudio IDE with a list of possible models for each model mode. THese can be written to the source code panel. 
+
+The model list includes modules from __parsnip__ and __parsnip__ extension packages that are on CRAN.
+
+## CHAPTER SUMMARY
+This chapter introduced the parsnip package, which provides a common interface for models across R packages using a standard syntax. The interface and resulting objects have a predictable structure.
+
+```{r}
+library(tidymodels)
+data(ames)
+ames <- mutate(ames, Sale_Price = log10(Sale_Price))
+
+set.seed(502)
+ames_split <- initial_split(ames, prop = 0.80, strata = Sale_Price)
+ames_train <- training(ames_split)
+ames_test  <-  testing(ames_split)
+
+lm_model <- linear_reg() %>% set_engine("lm")
+```
+
+
+# CHAPTER 7 A MODEL WORKFLOW
+
+In the previous chapter, we discussed the _parsnip_ package, which can be used to define and fit the model. This chapter introduces a new concept called a model workflow. The purpose of this concept (and the corresponding tidymodels _workflow()_ object) is to encapsulate the major pieces of the modeling process (discussed in Section 1.5). The workflow is important in two ways. First, using a workflow concept encourages good methodology since it is a single point of entry to the estimation components of a data analysis. Second, it enables the user to better organize projects. These two points are discussed in the following sections
+
+## WHERE DOES THE MODEL BEGIN AND END
+
+So far, when we have used the term "the model", we have meant a structural equation that relates some predictors to one or more outcomes. 
+
+Let's consider again liner regression as an example. The outcome data are denoted as $y_i$, where there are $i = 1,...,n$ samples in the training set. Suppose that there are $p$ predictors $x_{i1}, ..., x_{ip}$.
+
+$$
+y_i = \beta_o + \beta_1x_{i1}+...+\beta_px_{ip} 
+$$
+
+While this is a linear model, it is linear only in the parameters. The predictors could be nonlinear terms (such as the $log(x_i)$).
+
+For some straightforward data sets, fitting the model itself may be the entire process. However, a variety of choices and additional steps often occur before the model is fit:
+
+- While our example model has  $p$ predictors, it is common to start with more than  $p$  candidate predictors. Through __exploratory data analysis__ or using domain knowledge, some of the predictors may be excluded from the analysis. In other cases, a feature selection algorithm may be used to make a data-driven choice for the minimum predictor set for the model.
+- There are times when the value of an important predictor is missing. Rather than eliminating this sample from the data set, the missing value could be imputed using other values in the data. For example, if  $x_1$  were missing but was correlated with predictors $x_2$ and $x_3$, an imputation method could estimate the missing  $x_1$ observation from the values of $x_2$ and $x_3$.
+- It may be beneficial to transform the scale of a predictor. If there is not a priori information on what the new scale should be, we can estimate the proper scale using a statistical transformation technique, the existing data, and some optimization criterion. Other transformations, such as PCA, take groups of predictors and transform them into new features that are used as the predictors.
+
+While these examples are related to steps that occur before the model fit, there may also be operations that occur after the model is created. When a classification model is created where the outcome is binary (e.g., `event` and `non-event`), it is customary to use a 50% probability cutoff to create a discrete class prediction, also known as a hard prediction. For example, a classification model might estimate that the probability of an event was 62%. Using the typical default, the hard prediction would be event. However, the model may need to be more focused on reducing false positive results (i.e., where true nonevents are classified as events). One way to do this is to raise the cutoff from 50% to some greater value. This increases the level of evidence required to call a new sample an event. While this reduces the true positive rate (which is bad), it may have a more dramatic effect on reducing false positives. The choice of the cutoff value should be optimized using data. This is an example of a post-processing step that has a significant effect on how well the model works, even though it is not contained in the model fitting step.
+
+It is important to focus on the broader _modeling process_, instead of only fitting the specific model used to estimate parameters. This broader process includes any preprocessing steps, the model fit itself, as well as potential post-processing activities. In this book, we will refer to this more comprehensive concept as the model workflow and highlight how to handle all its components to produce a final model equation.
+
+
+Binding together the analytical components of data analysis is important for another reason. Future chapters will demonstrate how to accurately measure performance, as well as how to optimize structural parameters (i.e., model tuning). To correctly quantify model performance on the training set, Chapter 10 advocates using resampling methods. To do this properly, no data-driven parts of the analysis should be excluded from validation. To this end, the workflow must include all significant estimation steps.
+
+To illustrate, consider principal component analysis (PCA) signal extraction. We’ll talk about this more in Section 8.4 as well as Chapter 16; PCA is a way to replace correlated predictors with new artificial features that are uncorrelated and capture most of the information in the original set. The new features could be used as the predictors, and least squares regression could be used to estimate the model parameters.
+
+There are two ways of thinking about the model workflow. Figure 7.1 illustrates the incorrect method: to think of the PCA preprocessing step, as not being part of the modeling workflow.
+
+The fallacy here is that, although PCA does significant computations to produce the components, its operations are assumed to have no uncertainty associated with them. The PCA components are treated as known and, if not included in the model workflow, the effect of PCA could not be adequately measured.
+
+## WORKFLOW BASICS
+
+The `workflows` package allows the user to bind modeling and preprocessing objects together. Let's start again with the `Ames` data and a simple linear model:
+
+```{r}
+library(tidymodels)
+tidymodels_prefer()
+
+lm_model <- linear_reg() %>% 
+  set_engine("lm")
+```
+
+A workflow always requires a `parsnip` model object:
+
+```{r}
+lm_wflow <- 
+  workflow() %>% 
+  add_model(lm_model)
+
+lm_wflow
+```
+Notice that we have not yet specified how this workflow should preprocess the data: `Preprocessor`: `None`.
+
+If our model is very simple, a standard R formula can be used as a preprocessor:
+
+```{r}
+lm_wflow <- 
+  lm_wflow %>% 
+  add_formula(Sale_Price ~ Longitude + Latitude)
+
+lm_wflow
+```
+Workflows have a fit() method that can be used to create the model. Using the objects created in Section 6.6:
+
+```{r}
+lm_fit <- fit(lm_wflow, ames_train)
+lm_fit
+```
+
+We can also `predict()` on the fitted workflow:
+
+```{r}
+predict(lm_fit, ames_test %>% slice(1:3))
+```
+
+The `predict()` method follows all of the same rules and naming conventions that we described for the `parsnip` package in section 6.3.
+
+Both the model and preprocessors can be removed or updated
+
+```{r}
+lm_fit %>% update_formula(Sale_Price ~ Longtitude)
+```
+
+Note that, in this new object, the output shows that the previous fitted model was removed since the new formula is inconsistent with the previous model fit.
+
+## ADDING RAW VARIABLES TO THE `WORKFLOW()`
+
+There is another interface for passing data to the model, the `add_variables()` function, which uses a dplyr-like syntax for choosing variables. The function has two primary arguments: outcomes and predictors. These use a selection approach similar to the tidyselect backend of tidyverse packages to capture multiple selectors using `c()`.
+
+```{r}
+lm_wflow <- 
+  lm_wflow %>% 
+  remove_formula() %>% 
+  add_variables(outcomes = Sale_Price, predictors = c(Longitude, Latitude))
+```
+
+The predictors could also have been specified using a more general selector, such as 
+
+```{r eval=FALSE}
+predictors = c(ends_with("tude"))
+```
+
+One nicety is that any outcome columns accidentally  specified in the predictors argument will be quietly removed. This faciliates the use of 
+
+```{r eval=FALSE}
+predictors = everything()
+```
+
+When the model is fit, the specification assembles these data, unaltered, into a data frame and passes it to the underlying function:
+
+```{r}
+fit(lm_wflow, ames_train)
+```
+
+If you would like the underlying modeling method to do what it would normally do with the data, `add_variables()` can be a helpful interface. As we will see in Section 7.4.1, it also facilitates more complex modeling specifications. 
+
+However, as we mention in the next section, models such as glmnet and xgboost expect the user to make indicator variables from factor predictors. In these cases, a recipe or formula interface will typically be a better choice.
+
+In the next chapter, we will look at a more powerful preprocessors (called a `recipe`) that can also be added to a workflow.
+
+
+## HOW DOES A `workflow()` USE THE FORMULA?
+
+Recall from Section 3.2 that the formula method in R has multiple purposes (we will discuss this further in Chapter 8). One of these is to properly encode the original data into an analysis-ready format.
+
+ This can involve executing inline transformations (e.g., `log(x)`), creating dummy variable columns, creating interactions or other column expansions, and so on. However, many statistical methods require different types of encodings:
+ 
+- Most packages for tree-based models use the formula interface but do not encode the categorical predictors as dummy variables.
+- Packages can use special inline functions that tell the model function how to treat the predictor in the analysis. For example, in survival analysis models, a formula term such as `strata(site)` would indicate that the column `site` is a stratification variable. This means it should not be treated as a regular predictor and does not have a corresponding location parameter estimate in the model.
+- A few R packages have extended the formula in ways that base R functions cannot parse or execute. In multilevel models (e.g., mixed models or hierarchical Bayesian models), a model term such as (`week | subject`) indicates that the column `week` is a random effect that has different slope parameter estimates for each value of the `subject` column.
+
+A workflow is a general purpose interface. When `add_formula()` is used, how should the workflow preprocess the data? Since the preprocessing is model dependent, __workflows__ attempts to emulate what the underlying model would do whenever possible. If it is not possible, the formula processing should not do anything to the columns used in the formula. Let's look at this in more details.
+
+### TREE-BASED MODELS 
+
+When we fit a tree to the data, the `parsnip` package understands what the modeling function would do. For example, if a random forest model is fit using the `ranger` or `random Forest` packages, the workflow knows predictors columns that a re factors should be left as is. 
+
+As a counterexample, a boosted tree created with the `xgboost` package requires the user to create dummy variables from factor predictors (since `xgboost::xgb.train()` will not). This requirement is embedded into the model specification object and a workflow using `xgboost` will create the indicator columns for this engine. Also note that a different engine for boosted trees, C5.0, does not require dummy variables so none are made by the workflow.
+
+This determination is made for each model and engine combination.
+
+### SPECIFIC FORMULAS AND INLINE FUNCTIONS
+
+A number of multilevel models have standardized on a formula specification devised in the lme4 package. For example, to fit a regression model that has random effects for subjects, we would use the following formula:
+
+```{r eval=FALSE}
+pacman::p_load(lme4)
+lme4::lmer(distance ~ Sex + (age ))
+```
+
+## CREATING MULTIPLE WORKFLOWS AT ONCE
+
+In some situations, the data require numerous attempts to find an appropriate model. For example, 
+
+
+- For predictive models, it is advisable to evaluate a variety of different model types. This requires the user to create multiple model specifications.
+
+- Sequential testing of models typically starts with an expanded set of predictors. This “full model” is compared to a sequence of the same model that removes each predictor in turn. Using basic hypothesis testing methods or empirical validation, the effect of each predictor can be isolated and assessed.
+
+
+In these situations, as well as others, it can become tedious or onerous to create a lot of workflows from different sets of preprocessors and/or model specifications. To address this problem, the `workflowset` package creates combinations of workflow components. 
+
+A list of preprocessors (e.g., formulas, `dplyr` selectors, or feature engineering recipe objects discussed in the next chapter) can be combined with a list of model specifications, resulting in a set of workflows. 
+
+As an example, let's say that we want to focus on the different ways that house location is represented in the Ames data. We can create a set of formulas that capture these predictors. 
+
+```{r}
+location <- list(
+  longtitude = Sales_Price ~ Longitude,
+  latitude = Sale_Price ~ Latitude,
+  coords = Sale_Price ~ Longitude + Latitude,
+  neighborhood = Sale_Price ~ Neighborhood
+)
+```
+
+These representations can be crossed with one or more models using the `workflow_set()` function. We’ll just use the previous linear model specification to demonstrate:
+
+```{r}
+pacman::p_load(workflowsets)
+
+location_models <- workflow_set(preproc = location, models = list(lm = lm_model))
+
+location_models
+```
+
+Workflow sets are mostly designed to work with resampling, which is discussed in Chapter 10. The columns `option` and `result` must be populated with specific types of objects that result from resampling. We will demonstrate this in more detail in Chapters 11 and 15.
+
+In the meantime, let's create model fits for each formula and save them in a new column called `fit`. We will use `dplyr` and `purrr` operations:
+
+```{r eval=FALSE}
+
+location_models <-
+   location_models %>%
+   mutate(fit = map(info, ~ fit(.x$workflow[[1]], ames_train)))
+
+location_models
+```
+
+We use a purrr function here to map through our models, but there is an easier, better approach to fit workflow sets that will be introduced in Section 11.1.
+
+## EVALUATING THE TEST SET
+
+Let’s say that we’ve concluded our model development and have settled on a final model. There is a convenience function called `last_fit()` that will fit the model to the entire training set and evaluate it with the testing set.
+
+Using `lm_wflow` as an example, we can pass the model and the initial training/testing split to the function:
+
+```{r}
+final_lm_res <- last_fit(lm_wflow, ames_split)
+
+final_lm_res
+```
+
+Notice that last_fit() takes a data split as an input, not a dataframe. This function uses the split to generate the training and test sets for the final fitting and evaluation.
+
+The `.workflow` column contains the fitted workflow and can be pulled out of the results using: 
+
+```{r}
+fitted_lm_wflow <- extract_workflow(final_lm_res)
+```
+
+Similarly, `collect_metrics()` and `collect_predictions()` provide access to the performance metrics and predictions, respectively.
+
+```{r}
+collect_metrics(final_lm_res)
+collect_predictions(final_lm_res) %>% slice(1:5)
+```
+
+We’ll see more about `last_fit()` in action and how to use it again in Section 16.6.
+
+## CHAPTER SUMMARY
+In this chapter, you learned that the modeling process encompasses more than just estimating the parameters of an algorithm that connects predictors to an outcome. This process also includes preprocessing steps and operations taken after a model is fit. We introduced a concept called a model workflow that can capture the important components of the modeling process. Multiple workflows can also be created inside of a workflow set. The last_fit() function is convenient for fitting a final model to the training set and evaluating with the test set.
+
+# CHAPTER 8. Feature Engineering with `recipes`
+
+Feature engineering entails reformatting predictor values to make them easier for a model to use effectively. This includes transformations and encodings of the data to best represent their important characteristics. Imagine that you have two predictors in a data set that can be more effectively represented in your model as a ratio; creating a new predictor from the ratio of the original two is a simple example of feature engineering.
+
+Take the location of a house in Ames as a more involved example. There are a variety of ways that this spatial information can be exposed to a model, including neighborhood (a qualitative measure), longitude/latitude, distance to the nearest school or Iowa State University, and so on. When choosing how to encode these data in modeling, we might choose an option we believe is most associated with the outcome. The original format of the data, for example numeric (e.g., distance) versus categorical (e.g., neighborhood), is also a driving factor in feature engineering choices.
+
+
+
